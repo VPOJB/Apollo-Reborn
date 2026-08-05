@@ -1,0 +1,205 @@
+name: Build and Upload to TestFlight
+
+# Builds the tweak, injects it into Apollo (no-extensions variant),
+# rebrands to ca.bowness.apollo, signs with your App Store distribution
+# certificate, and uploads to TestFlight for internal testing.
+#
+# Required secrets (Settings → Secrets and variables → Actions):
+#   APOLLO_IPA_URL               URL to a decrypted Apollo IPA
+#   DISTRIBUTION_CERTIFICATE_P12 base64-encoded iPhone Distribution .p12
+#   DISTRIBUTION_CERTIFICATE_PASSWORD  password for the .p12 (can be empty)
+#   PROVISIONING_PROFILE_BASE64  base64-encoded App Store .mobileprovision
+#                                for ca.bowness.apollo
+#   KEYCHAIN_PASSWORD            any random string (e.g. openssl rand -hex 32)
+#   ASC_API_KEY_ID               App Store Connect API key ID (e.g. AB12CD34EF)
+#   ASC_API_ISSUER_ID            ASC API issuer UUID
+#   ASC_API_PRIVATE_KEY          base64-encoded .p8 private key content
+#
+# App Store Connect setup (one-time, before first run):
+#   1. Register App ID "ca.bowness.apollo" in developer.apple.com (enable Push)
+#   2. Create an App record in App Store Connect (same bundle ID)
+#   3. Create an "App Store" distribution provisioning profile for that App ID
+#   4. Create an App Store Connect API key (App Manager role or higher)
+#   5. Export your iPhone Distribution certificate as a .p12
+#
+# Encode files for secrets:
+#   base64 -i certificate.p12 | pbcopy
+#   base64 -i profile.mobileprovision | pbcopy
+#   base64 -i AuthKey_XXXX.p8 | pbcopy
+
+on:
+  workflow_dispatch:
+    inputs:
+      apollo_ipa_url:
+        description: 'Decrypted Apollo IPA URL (leave blank to use APOLLO_IPA_URL secret)'
+        required: false
+        type: string
+      liquid_glass:
+        description: 'Apply Liquid Glass iOS 26 UI patch'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  testflight:
+    name: Build and upload to TestFlight
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: brew install ldid dpkg make
+
+      - name: Add GNU make to PATH
+        run: echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Setup Theos
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: theos/theos
+          ref: 9bc73406cf80b711ef4d02c15ff1dedc4478a275 # master @ 2026-04-09
+          path: theos
+          submodules: recursive
+
+      - name: Select Xcode 26.0.1
+        run: sudo xcode-select -s /Applications/Xcode_26.0.1.app
+
+      - name: Build tweak package
+        run: make package FINALPACKAGE=1
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Locate .deb
+        id: deb
+        run: |
+          DEB_PATH=$(ls -1t packages/*.deb | head -1)
+          if [ -z "$DEB_PATH" ]; then
+            echo "Error: no .deb produced by make package" >&2
+            exit 1
+          fi
+          echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
+          echo "Built: $DEB_PATH"
+
+      - name: Install cyan injector
+        run: |
+          python3 -m venv "$RUNNER_TEMP/cyan-venv"
+          "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install \
+            "https://github.com/asdfzxcvbn/pyzule-rw/archive/refs/tags/v1.4.4.zip"
+          echo "$RUNNER_TEMP/cyan-venv/bin" >> "$GITHUB_PATH"
+          cyan --help >/dev/null
+
+      - name: Download Apollo IPA
+        run: |
+          IPA_URL="${{ inputs.apollo_ipa_url || secrets.APOLLO_IPA_URL }}"
+          if [ -z "$IPA_URL" ]; then
+            echo "Error: no Apollo IPA URL — pass as input or set APOLLO_IPA_URL secret" >&2
+            exit 1
+          fi
+          curl -L --fail --retry 3 "$IPA_URL" -o Apollo.ipa
+          unzip -t Apollo.ipa >/dev/null
+          echo "Apollo.ipa: $(wc -c < Apollo.ipa) bytes"
+
+      - name: Inject tweak (no extensions)
+        run: |
+          cyan -i Apollo.ipa -f "${{ steps.deb.outputs.deb_path }}" -o injected.ipa -e
+          mv -f injected.ipa Apollo.ipa
+          echo "Injected: $(wc -c < Apollo.ipa) bytes"
+
+      - name: Apply patches
+        run: |
+          ARGS="Apollo.ipa -o Apollo-Patched.ipa"
+          if [ "${{ inputs.liquid_glass }}" == "true" ]; then
+            ARGS="$ARGS --liquid-glass"
+          fi
+          chmod +x ./patch.sh
+          # shellcheck disable=SC2086
+          ./patch.sh $ARGS
+          echo "Patched: $(wc -c < Apollo-Patched.ipa) bytes"
+
+      - name: Rebrand to ca.bowness.apollo
+        run: |
+          chmod +x ./scripts/rebrand-ipa.sh
+          ./scripts/rebrand-ipa.sh Apollo-Patched.ipa ca.bowness.apollo \
+            -o Apollo-Rebranded.ipa
+          echo "Rebranded: $(wc -c < Apollo-Rebranded.ipa) bytes"
+
+      - name: Import distribution certificate
+        id: keychain
+        env:
+          CERTIFICATE_P12: ${{ secrets.DISTRIBUTION_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          echo "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Keep existing keychains in the list alongside the new one
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN_PATH" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          SIGN_ID=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | head -1 | sed -E 's/.*"(.+)"/\1/')
+          echo "Signing identity: $SIGN_ID"
+          echo "sign_id=$SIGN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Install provisioning profile
+        env:
+          PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          echo "$PROVISIONING_PROFILE" | base64 --decode \
+            > "$RUNNER_TEMP/profile.mobileprovision"
+          PP_UUID=$(security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" \
+            | plutil -extract UUID raw -o - -)
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" \
+            "$HOME/Library/MobileDevice/Provisioning Profiles/$PP_UUID.mobileprovision"
+          echo "Installed profile UUID: $PP_UUID"
+
+      - name: Sign IPA for App Store distribution
+        run: |
+          chmod +x ./scripts/resign-ipa-codesign.sh
+          ./scripts/resign-ipa-codesign.sh \
+            Apollo-Rebranded.ipa \
+            "${{ steps.keychain.outputs.sign_id }}" \
+            --profile "$RUNNER_TEMP/profile.mobileprovision" \
+            -o Apollo-Signed.ipa
+          echo "Signed: $(wc -c < Apollo-Signed.ipa) bytes"
+
+      - name: Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_API_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$ASC_PRIVATE_KEY" | base64 --decode \
+            > ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          xcrun altool --upload-app \
+            -f Apollo-Signed.ipa \
+            -t ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID" \
+            --verbose
+
+      - name: Upload signed IPA as artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Apollo-TestFlight-${{ github.run_number }}.ipa
+          path: Apollo-Signed.ipa
+          retention-days: 14
+          if-no-files-found: ignore
