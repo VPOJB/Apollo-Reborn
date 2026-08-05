@@ -107,7 +107,7 @@ KEY_FILE=$(ls "$SETUP_DIR"/*.p12 2>/dev/null | head -1)
 # Build a proper PKCS12 from the cert (DER) and private key (PEM)
 P12_PASS=$(openssl rand -hex 20)
 openssl x509 -inform DER -in "$CERT_FILE" -out "$SETUP_DIR/cert.pem"
-openssl pkcs12 -export \
+openssl pkcs12 -export -legacy \
     -inkey "$KEY_FILE" \
     -in "$SETUP_DIR/cert.pem" \
     -out "$SETUP_DIR/distribution.p12" \
