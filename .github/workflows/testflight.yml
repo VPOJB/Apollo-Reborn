@@ -132,7 +132,7 @@ jobs:
             -o Apollo-Rebranded.ipa
           echo "Rebranded: $(wc -c < Apollo-Rebranded.ipa) bytes"
 
-      - name: Import distribution certificate
+      - name: Import signing certificate
         id: keychain
         env:
           CERTIFICATE_P12: ${{ secrets.DISTRIBUTION_CERTIFICATE_P12 }}
@@ -142,7 +142,6 @@ jobs:
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
           echo "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          # Keep existing keychains in the list alongside the new one
           security list-keychains -d user -s "$KEYCHAIN_PATH" \
             $(security list-keychains -d user | tr -d '"')
           security default-keychain -s "$KEYCHAIN_PATH"
@@ -152,7 +151,8 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           SIGN_ID=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
-            | head -1 | sed -E 's/.*"(.+)"/\1/')
+            | grep -E "Apple Development|Apple Distribution" | head -1 \
+            | sed -E 's/.*"(.+)"/\1/')
           echo "Signing identity: $SIGN_ID"
           echo "sign_id=$SIGN_ID" >> "$GITHUB_OUTPUT"
 
@@ -169,7 +169,7 @@ jobs:
             "$HOME/Library/MobileDevice/Provisioning Profiles/$PP_UUID.mobileprovision"
           echo "Installed profile UUID: $PP_UUID"
 
-      - name: Sign IPA for App Store distribution
+      - name: Sign IPA for sideloading
         run: |
           chmod +x ./scripts/resign-ipa-codesign.sh
           ./scripts/resign-ipa-codesign.sh \
@@ -179,27 +179,10 @@ jobs:
             -o Apollo-Signed.ipa
           echo "Signed: $(wc -c < Apollo-Signed.ipa) bytes"
 
-      - name: Upload to TestFlight
-        env:
-          ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
-          ASC_PRIVATE_KEY: ${{ secrets.ASC_API_PRIVATE_KEY }}
-        run: |
-          mkdir -p ~/.appstoreconnect/private_keys
-          echo "$ASC_PRIVATE_KEY" | base64 --decode \
-            > ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
-          xcrun altool --upload-app \
-            -f Apollo-Signed.ipa \
-            -t ios \
-            --apiKey "$ASC_KEY_ID" \
-            --apiIssuer "$ASC_ISSUER_ID" \
-            --verbose
-
       - name: Upload signed IPA as artifact
-        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: Apollo-TestFlight-${{ github.run_number }}.ipa
+          name: Apollo-Sideload-${{ github.run_number }}.ipa
           path: Apollo-Signed.ipa
-          retention-days: 14
-          if-no-files-found: ignore
+          retention-days: 30
+          if-no-files-found: error
