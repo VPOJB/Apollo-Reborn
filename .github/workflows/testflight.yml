@@ -95,7 +95,7 @@ jobs:
           "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install \
             "https://github.com/asdfzxcvbn/pyzule-rw/archive/refs/tags/v1.4.4.zip"
           echo "$RUNNER_TEMP/cyan-venv/bin" >> "$GITHUB_PATH"
-          cyan --help >/dev/null
+          "$RUNNER_TEMP/cyan-venv/bin/cyan" --help >/dev/null
 
       - name: Download Apollo IPA
         run: |
